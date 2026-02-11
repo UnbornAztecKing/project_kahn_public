@@ -48,6 +48,7 @@ load_dotenv(os.path.join(BASE_DIR, '..', '..', 'Schelling.env'))  # Fallback to 
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY') or os.getenv('GEMINI_API_KEY')
+OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434/v1')
 
 if openai and OPENAI_API_KEY:
     import httpx
@@ -55,6 +56,7 @@ if openai and OPENAI_API_KEY:
     openai_client = openai.OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 else:
     openai_client = None
+ollama_client = openai.OpenAI(api_key='ollama', base_url=OLLAMA_BASE_URL) if openai else None
 if anthropic and ANTHROPIC_API_KEY:
     anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 else:
@@ -344,6 +346,17 @@ def get_llm_response(model: str, prompt: str, temperature: float = 0.7, max_toke
                     {"text": prompt},
                 ], generation_config={"temperature": temperature, "max_output_tokens": max_tokens})
                 return resp.text
+            elif m.startswith('ollama:'):
+                if not ollama_client:
+                    raise RuntimeError("Ollama client not configured (requires openai package)")
+                ollama_model = model[len('ollama:'):]
+                resp = ollama_client.chat.completions.create(
+                    model=ollama_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return resp.choices[0].message.content
             raise RuntimeError("No supported provider for model: " + model)
         except Exception as e:
             last_err = e
