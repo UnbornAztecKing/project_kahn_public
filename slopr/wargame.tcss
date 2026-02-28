@@ -1,0 +1,489 @@
+/* Wargame TUI — borderless toolong-inspired style */
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+
+Screen {
+    background: $background;
+}
+
+Header {
+    dock: top;
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+}
+
+Footer {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+}
+
+#main-container {
+    height: 1fr;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+
+TurnSidebar {
+    width: 1fr;
+    max-width: 30;
+    min-width: 22;
+    background: $surface;
+    border: round $surface-lighten-2;
+}
+
+.sidebar-header {
+    height: 1;
+    background: $surface-lighten-1;
+    color: $text-muted;
+    text-style: bold;
+    text-align: center;
+    padding: 0 1;
+}
+
+#turn-index {
+    height: 1fr;
+    background: $surface;
+    scrollbar-size: 1 1;
+}
+
+#turn-index:focus {
+    border: none;
+}
+
+/* ── Content pane ────────────────────────────────────────────────────────── */
+
+ContentPane {
+    width: 3fr;
+    background: $background;
+    scrollbar-size: 1 1;
+}
+
+/* ── Phase group boxes (Collapsible overrides) ───────────────────────────── */
+
+.phase-group {
+    height: auto;
+    background: $background;
+    border: round $surface-lighten-2;
+    margin: 0;
+    padding: 0;
+    padding-left: 0;
+    padding-bottom: 0;
+}
+
+.phase-group > CollapsibleTitle {
+    color: $text-muted;
+    text-style: bold;
+    padding: 0 1;
+    height: 1;
+    background: transparent;
+}
+
+/* Phase group colors — hex values mirrored exactly in turn_sidebar._PHASE_COLORS */
+.group-reflection {
+    border: round #00bcd4;
+}
+
+.group-forecast {
+    border: round #42a5f5;
+}
+
+.group-signal {
+    border: round #ab47bc;
+}
+
+.group-action {
+    border: round #ffa726;
+}
+
+.group-endstate {
+    border: round #90a4ae;
+}
+
+.group-initialstate {
+    border: round #546e7a;
+}
+
+.group-game {
+    border: round #4caf50;
+}
+
+.group-scenario {
+    border: round #4caf50;
+}
+
+.group-profiles {
+    border: round #7986cb;
+}
+
+.group-gameover {
+    border: round #ef5350;
+}
+
+.group-banner {
+    border: round #daa520;
+}
+
+.group-parameters {
+    border: round #26a69a;
+}
+
+.group-reflection > CollapsibleTitle  { color: #00bcd4; }
+.group-forecast > CollapsibleTitle    { color: #42a5f5; }
+.group-signal > CollapsibleTitle      { color: #ab47bc; }
+.group-action > CollapsibleTitle      { color: #ffa726; }
+.group-endstate > CollapsibleTitle    { color: #90a4ae; }
+.group-initialstate > CollapsibleTitle { color: #546e7a; }
+.group-game > CollapsibleTitle        { color: #4caf50; }
+.group-scenario > CollapsibleTitle    { color: #4caf50; }
+.group-profiles > CollapsibleTitle    { color: #7986cb; }
+.group-gameover > CollapsibleTitle    { color: #ef5350; }
+.group-banner > CollapsibleTitle      { color: #daa520; }
+.group-parameters > CollapsibleTitle  { color: #26a69a; }
+
+/* ── Event cards ─────────────────────────────────────────────────────────── */
+
+EventCard {
+    height: auto;
+    padding: 0 1;
+    margin: 0;
+}
+
+EventCard:hover {
+    background: $surface-lighten-1 20%;
+}
+
+EventCard:focus {
+    background: $surface-lighten-1 30%;
+}
+
+/* ── Event divider (thin rule between events within a group) ─────────────── */
+
+.event-divider {
+    color: $surface-lighten-2;
+    height: 1;
+    margin: 0 1;
+}
+
+/* ── Source badges ───────────────────────────────────────────────────────── */
+
+.source-badge {
+    color: $text-muted;
+    text-style: bold;
+    height: 1;
+}
+
+/* ── Event title — per-type coloring ─────────────────────────────────────── */
+
+.event-title {
+    text-style: bold;
+    height: 1;
+}
+
+.title-phase {
+    color: $accent;
+}
+
+.title-state {
+    color: $primary-lighten-2;
+}
+
+.title-kpi {
+    color: $secondary;
+}
+
+.title-report {
+    color: $warning;
+}
+
+.title-game {
+    color: $success;
+}
+
+/* ── Side coloring ───────────────────────────────────────────────────────── */
+
+.side-a {
+    color: #5b9cf5;
+}
+
+.side-b {
+    color: #f55b5b;
+}
+
+/* ── Event body & metadata ───────────────────────────────────────────────── */
+
+.event-body {
+    color: $text;
+    margin: 0 0 0 1;
+}
+
+.event-meta {
+    color: $text-disabled;
+    margin: 0 0 0 1;
+    height: 1;
+}
+
+.event-accident {
+    color: $error;
+    text-style: bold;
+}
+
+.event-data-header {
+    color: $text-disabled;
+    text-style: italic;
+    margin: 0 0 0 1;
+    height: 1;
+}
+
+.event-data-key {
+    color: $text-muted;
+    margin: 0 0 0 1;
+}
+
+.event-data-val {
+    color: $text;
+    margin: 0 0 0 2;
+}
+
+.event-data-kv {
+    color: $text;
+    margin: 0 0 0 1;
+}
+
+/* ── Table rule (borderless separator for tabular sections) ──────────────── */
+
+.table-rule {
+    color: $surface-lighten-2;
+    height: 1;
+    margin: 0 0 0 1;
+}
+
+/* ── KPI bar ─────────────────────────────────────────────────────────────── */
+
+KPIBar {
+    dock: bottom;
+    height: 3;
+    background: $surface;
+    layout: horizontal;
+    overflow-x: auto;
+    scrollbar-size: 1 1;
+}
+
+KPIIndicator {
+    width: auto;
+    min-width: 16;
+    padding: 0 1;
+    height: auto;
+    max-height: 2;
+}
+
+.kpi-label {
+    color: $text-muted;
+    text-style: bold;
+    height: 1;
+}
+
+.kpi-value {
+    color: $text;
+    height: 1;
+}
+
+.kpi-normal .kpi-value {
+    color: $success;
+}
+
+.kpi-warning .kpi-value {
+    color: $warning;
+}
+
+.kpi-critical .kpi-value {
+    color: $error;
+}
+
+/* ── Split A/B view ──────────────────────────────────────────────────────── */
+
+/* Each row in the aligned grid — a Horizontal pairing A and B cells. */
+.split-field-row {
+    height: auto;
+}
+
+/* Each cell in an aligned row — takes equal half-width. */
+.split-field {
+    width: 1fr;
+    height: auto;
+}
+
+/* Left (A-side) cell — carries the vertical divider. */
+.split-field-a {
+    border-right: solid $surface-lighten-2;
+}
+
+/* TagCards in the A-side keep their gold right border (overrides .split-field-a above). */
+TagCard.split-field-a {
+    border-right: solid #daa520;
+}
+
+/* Column label shown at the top of the A/B grid. */
+.split-header {
+    height: 1;
+    text-style: bold;
+    padding: 0 1;
+    background: $surface;
+}
+
+.split-header-a {
+    color: #5b9cf5;
+}
+
+.split-header-b {
+    color: #f55b5b;
+}
+
+/* ── Pane switcher ────────────────────────────────────────────────────────── */
+
+.main-pane {
+    display: none;
+    width: 3fr;
+    height: 1fr;
+}
+
+.main-pane.--active {
+    display: block;
+}
+
+/* ── PaneNavBar (bottom of TurnSidebar) ──────────────────────────────────── */
+
+PaneNavBar {
+    height: 1;
+    dock: bottom;
+    layout: horizontal;
+    align: left middle;
+    background: $surface;
+    border-top: solid $surface-lighten-2;
+    padding: 0 1;
+}
+
+/* ── BranchPane ───────────────────────────────────────────────────────────── */
+
+BranchPane {
+    layout: horizontal;
+}
+
+/* BranchManager inside BranchPane is always visible */
+BranchPane BranchManager {
+    display: block;
+    height: 1fr;
+    width: 2fr;
+    border-top: none;
+    border-right: solid $surface-lighten-2;
+    padding: 0 1;
+}
+
+BranchPane BranchManager .panel-title {
+    text-style: bold;
+    color: $text-muted;
+    height: 1;
+    padding: 0 0 0 1;
+    margin-bottom: 1;
+}
+
+BranchPane BranchManager Tree {
+    height: 1fr;
+    background: $surface;
+}
+
+BranchPane BranchManager #btn-row {
+    height: 3;
+    dock: bottom;
+    align: center middle;
+}
+
+BranchPane BranchManager #btn-spawn {
+    margin-right: 1;
+}
+
+#branch-right-col {
+    width: 3fr;
+    height: 1fr;
+    layout: vertical;
+}
+
+#branch-detail {
+    height: 1fr;
+    background: $background;
+    scrollbar-size: 1 1;
+    padding: 0 1;
+}
+
+#branch-compare {
+    height: 8;
+    background: $surface;
+    border-top: solid $surface-lighten-2;
+}
+
+/* ── SimManagerPane ───────────────────────────────────────────────────────── */
+
+SimManagerPane {
+    height: 1fr;
+    layout: vertical;
+}
+
+#sim-table {
+    height: 1fr;
+    background: $background;
+}
+
+#sim-live-log {
+    height: 10;
+    background: $surface;
+    border-top: solid $surface-lighten-2;
+    scrollbar-size: 1 1;
+    padding: 0 1;
+}
+
+#sim-btn-row {
+    height: 3;
+    dock: bottom;
+    align: center middle;
+    background: $surface;
+}
+
+#btn-cancel {
+    margin-right: 1;
+}
+
+#btn-retry {
+    margin-right: 1;
+}
+
+/* ── Search ──────────────────────────────────────────────────────────────── */
+
+#search-bar {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+    border: none;
+}
+
+/* ── Annotation badges ───────────────────────────────────────────────────── */
+
+.annotation-badge {
+    color: #daa520;
+    text-style: italic;
+    height: 1;
+    margin: 0 0 0 1;
+}
+
+/* ── Split-pair wrapper ──────────────────────────────────────────────────── */
+
+.split-pair {
+    height: auto;
+    width: 1fr;
+}
+
+/* ── Tag split-view rows ─────────────────────────────────────────────────── */
+
+.ann-split-row {
+    height: auto;
+}
