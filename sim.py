@@ -9,10 +9,11 @@ Kahn Game v11: Three-Phase Decision Architecture + Decision Memory + Betrayal Me
 - All v9 features retained (military capabilities, gating, etc.)
 """
 
+from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any
 import argparse
-import json
+import orjson
 import logging
 import os
 import re
@@ -20,96 +21,241 @@ import sys
 import time
 
 from dotenv import load_dotenv
+from json_repair import repair_json
 
+from config import STATE_A, STATE_B, StateConfig, REGISTRY
 from scenarios import SCENARIOS, get_scenario_prompt
-
-# Optional provider SDKs (import guarded)
-try:
-    import openai
-except Exception:
-    openai = None
-try:
-    import anthropic
-except Exception:
-    anthropic = None
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
+from slopr.models import EventSource, EventType, GameEvent
+from slopr.event_writer import EventWriter
 
 # -----------------------------
 # Pathing and environment setup
 # -----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Look for .env file in current directory or parent directories
-load_dotenv(os.path.join(BASE_DIR, ".env"))  # Local .env first
-load_dotenv(os.path.join(BASE_DIR, "..", "..", "Schelling.env"))  # Fallback to project root
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+load_dotenv(os.path.join(BASE_DIR, "..", "..", "Schelling.env"))
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
-if openai and OPENAI_API_KEY:
-    import httpx
+# Active actor configs — set by run_kahn_game_v11() before each game.
+# Defaults to the classic State A/B pairing for backwards compatibility.
+_side_a_config: "StateConfig" = STATE_A
+_side_b_config: "StateConfig" = STATE_B
 
-    http_client = httpx.Client()
-    openai_client = openai.OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
-else:
-    openai_client = None
-ollama_client = openai.OpenAI(api_key="ollama", base_url=OLLAMA_BASE_URL) if openai else None
-if anthropic and ANTHROPIC_API_KEY:
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-else:
-    anthropic_client = None
-if genai and GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
+
+# ── Event-stream helper ──────────────────────────────────────────────────────
+
+
+def _emit(writer: EventWriter, **kwargs: Any) -> None:
+    """Emit a GameEvent; swallow errors to avoid crashing the sim."""
+    try:
+        seq = writer.next_seq()
+        writer.write(GameEvent(sequence_number=seq, **kwargs))
+    except Exception as exc:
+        logger.warning("Event emission failed (seq %s): %s", kwargs.get("sequence_number"), exc)
+
+
+# ── Model backends ────────────────────────────────────────────────────────────
+
+
+class Model(ABC):
+    """Single responsibility: issue one completion request to a provider."""
+
+    def __init__(self, model_id: str):
+        self._model_id = model_id
+
+    @abstractmethod
+    def complete(self, prompt: str, *, temperature: float, max_tokens: int) -> tuple[str, int, int]:
+        """Return (text, input_tokens, output_tokens)."""
+
+    @classmethod
+    @abstractmethod
+    def accepts(cls, model_id: str) -> bool:
+        """Return True if this backend should handle model_id."""
+
+
+class OpenAIModel(Model):
+    _client: Any = None
+
+    def __init__(self, model_id: str):
+        super().__init__(model_id)
+        if OpenAIModel._client is None:
+            import httpx
+            import openai as _openai
+
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY not configured")
+            OpenAIModel._client = _openai.OpenAI(api_key=api_key, http_client=httpx.Client())
+
+    @classmethod
+    def accepts(cls, model_id: str) -> bool:
+        m = model_id.lower()
+        return m.startswith(("gpt", "o1", "o3"))
+
+    def complete(self, prompt: str, *, temperature: float, max_tokens: int) -> tuple[str, int, int]:
+        m = self._model_id.lower()
+        is_reasoning = m.startswith("o1") or m.startswith("o3") or "gpt-5" in m
+        token_key = "max_completion_tokens" if is_reasoning else "max_tokens"
+        kwargs: dict = {
+            "model": self._model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            token_key: max_tokens,
+        }
+        if not (m.startswith("o1") or m.startswith("o3")):
+            kwargs["temperature"] = temperature
+        resp = self._client.chat.completions.create(**kwargs)
+        text = resp.choices[0].message.content or ""
+        usage = resp.usage
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+        return text, in_tok, out_tok
+
+
+class AnthropicModel(Model):
+    _client: Any = None
+
+    def __init__(self, model_id: str):
+        self._model_id = model_id
+        if AnthropicModel._client is None:
+            import anthropic as _anthropic
+
+            api_key = os.getenv("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY not configured")
+            AnthropicModel._client = _anthropic.Anthropic(api_key=api_key)
+
+    @classmethod
+    def accepts(cls, model_id: str) -> bool:
+        return model_id.lower().startswith("claude")
+
+    def complete(self, prompt: str, *, temperature: float, max_tokens: int) -> tuple[str, int, int]:
+        resp = self._client.messages.create(
+            model=self._model_id,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = "".join(block.text for block in resp.content if hasattr(block, "text"))
+        return text, resp.usage.input_tokens, resp.usage.output_tokens
+
+
+class GeminiModel(Model):
+    _configured = False
+
+    def __init__(self, model_id: str):
+        self._model_id = model_id
+        if not GeminiModel._configured:
+            import google.generativeai as _genai
+
+            api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                raise RuntimeError("GOOGLE_API_KEY / GEMINI_API_KEY not configured")
+            _genai.configure(api_key=api_key)
+            GeminiModel._configured = True
+
+    @classmethod
+    def accepts(cls, model_id: str) -> bool:
+        return model_id.lower().startswith("gemini")
+
+    def complete(self, prompt: str, *, temperature: float, max_tokens: int) -> tuple[str, int, int]:
+        import google.generativeai as _genai
+
+        gmodel = _genai.GenerativeModel(self._model_id)
+        resp = gmodel.generate_content(
+            [{"text": prompt}],
+            generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
+        )
+        text = resp.text
+        try:
+            in_tok = resp.usage_metadata.prompt_token_count or 0
+            out_tok = resp.usage_metadata.candidates_token_count or 0
+        except Exception:
+            in_tok = out_tok = 0
+        return text, in_tok, out_tok
+
+
+class OllamaModel(Model):
+    _client: Any = None
+
+    def __init__(self, model_id: str):
+        self._ollama_model = model_id[len("ollama:") :]
+        if OllamaModel._client is None:
+            import openai as _openai
+
+            OllamaModel._client = _openai.OpenAI(
+                api_key="ollama",
+                base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+            )
+
+    @classmethod
+    def accepts(cls, model_id: str) -> bool:
+        return model_id.lower().startswith("ollama:")
+
+    def complete(self, prompt: str, *, temperature: float, max_tokens: int) -> tuple[str, int, int]:
+        resp = self._client.chat.completions.create(
+            model=self._ollama_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = resp.choices[0].message.content or ""
+        usage = resp.usage
+        in_tok = getattr(usage, "prompt_tokens", 0) or 0
+        out_tok = getattr(usage, "completion_tokens", 0) or 0
+        return text, in_tok, out_tok
+
+
+# ── Single change point: register new backends here ───────────────────────────
+_REGISTRY: list[type[Model]] = [
+    OpenAIModel,
+    AnthropicModel,
+    GeminiModel,
+    OllamaModel,
+]
+
+_model_cache: dict[str, Model] = {}
+
+
+def get_model(model_id: str) -> Model:
+    """Return (and cache) the backend instance for the given model ID."""
+    if model_id not in _model_cache:
+        for cls in _REGISTRY:
+            if cls.accepts(model_id):
+                _model_cache[model_id] = cls(model_id)
+                break
+        else:
+            raise ValueError(f"No registered backend accepts model '{model_id}'")
+    return _model_cache[model_id]
+
+
+def _extract_json_dict(text: str) -> dict[str, Any]:
+    """Call repair_json and reduce its output to a single dict.
+
+    repair_json(return_objects=True) returns a Python object — dict, list,
+    scalar, or None — depending on what it found in the text.  When it finds
+    multiple objects it may return a list.  This function flattens that into
+    the single dict that best represents a structured LLM response, preferring
+    the dict with the most keys.
+    """
+    obj = repair_json(text, return_objects=True)
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, list):
+        dicts = [item for item in obj if isinstance(item, dict)]
+        if dicts:
+            return max(dicts, key=lambda d: len(d))
+    return {}
 
 
 def parse_json_response(text: str | None) -> dict[str, Any]:
-    """Robust JSON parsing with fallback - copied from v5"""
-    if text is None:
+    """Robust JSON parsing using json-repair to handle malformed LLM output."""
+    if not text:
         return {}
+    result = _extract_json_dict(text)
+    if not result:
+        logger.warning(f"parse_json_response: could not extract dict from response: {text[:200]!r}")
+    return result
 
-    try:
-        result = json.loads(text)
-        # DEBUG: Log the keys for debugging Gemini parsing issues
-        logger.info(f"DEBUG: JSON keys found: {list(result.keys())}")
-        return result
-    except Exception:
-        # Try to extract JSON from markdown blocks first
-        import re
-
-        json_match = re.search(r"```json\s*(.*?)\s*```", text, re.DOTALL)
-        if json_match:
-            try:
-                result = json.loads(json_match.group(1))
-                logger.info(f"DEBUG: JSON keys found (from markdown): {list(result.keys())}")
-                return result
-            except Exception:
-                pass
-
-        # Try to extract JSON blob
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                result = json.loads(text[start : end + 1])
-                logger.info(f"DEBUG: JSON keys found (from extraction): {list(result.keys())}")
-                return result
-            except Exception:
-                pass
-        logger.warning(f"DEBUG: No JSON found in text: {text[:200]}...")
-        return {}
-
-
-def load_json_safe(path_rel: str) -> Any:
-    """Load JSON data from file with safe error handling"""
-    path = path_rel if os.path.isabs(path_rel) else os.path.join(BASE_DIR, path_rel)
-    if not os.path.exists(path):
-        return None
-    with open(path, "r") as f:
-        return json.load(f)
 
 
 def get_nuclear_multiplier(action_value: float) -> float:
@@ -148,25 +294,13 @@ def apply_gated_value(action_value: float, gating_off: bool) -> float:
     return action_value
 
 
-def get_base_military_capabilities(state: str) -> dict[str, float]:
-    """
-    Extract BASE military capabilities from JSON profiles.
-    These are the starting capabilities, not current military power.
-
-    Based on state_a_assessment_kahn.json and state_b_assessment_kahn.json:
-    - State A: "technologically superior" nuclear, "limited but well equipped" conventional
-    - State B: "rapidly expanding but inferior" nuclear, "massive but logistics limited" conventional
-    """
-    if state == "A":
-        return {
-            "nuclear": 0.8,  # "technologically superior but not overwhelming"
-            "conventional": 0.6,  # "limited but well equipped"
-        }
-    else:  # State B
-        return {
-            "nuclear": 0.6,  # "rapidly expanding but technologically inferior"
-            "conventional": 0.9,  # "massive but logistics limited"
-        }
+def get_base_military_capabilities(side: str) -> dict[str, float]:
+    """Extract BASE military capabilities for the given structural side ('A' or 'B')."""
+    cfg = _side_a_config if side == "A" else _side_b_config
+    return {
+        "nuclear": cfg.military.base_nuclear_capability,
+        "conventional": cfg.military.base_conventional_capability,
+    }
 
 
 def calculate_relative_fighting_power(
@@ -345,67 +479,41 @@ def update_territory_and_military(
 
 def get_llm_response(
     model: str, prompt: str, temperature: float = 0.7, max_tokens: int = 3000, retries: int = 3
-) -> str | None:
-    """Get response from LLM - compatible with api_clients interface"""
-    last_err = None
+) -> tuple[str, dict]:
+    """Issue a completion request, retrying on transient errors.
+
+    Returns ``(response_text, metadata)`` where *metadata* is a dict with keys
+    ``model``, ``temperature``, ``max_tokens``, ``input_tokens``, ``output_tokens``.
+    """
+    backend = get_model(model)
+    meta: dict = {
+        "model": model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+    last_err: Exception | None = None
     for _ in range(retries):
         try:
-            m = model.lower()
-            if m.startswith("gpt") or m.startswith("o1") or m.startswith("o3"):
-                if not openai_client:
-                    raise RuntimeError("OpenAI client not configured")
-                # GPT-5.x, o1, o3 models use max_completion_tokens instead of max_tokens
-                is_new_model = "gpt-5" in m or m.startswith("o1") or m.startswith("o3")
-                token_param = "max_completion_tokens" if is_new_model else "max_tokens"
-
-                kwargs = {
-                    "model": (model or "gpt-4o-2024-08-06"),
-                    "messages": [{"role": "user", "content": prompt}],
-                    token_param: max_tokens,
-                }
-                # New reasoning models don't support temperature
-                if not (m.startswith("o1") or m.startswith("o3")):
-                    kwargs["temperature"] = temperature
-
-                resp = openai_client.chat.completions.create(**kwargs)
-                return resp.choices[0].message.content
-            elif m.startswith("claude") and anthropic_client:
-                resp = anthropic_client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return "".join(block.text for block in resp.content)
-            elif m.startswith("gemini") and genai:
-                gmodel = genai.GenerativeModel(model)
-                resp = gmodel.generate_content(
-                    [
-                        {"text": prompt},
-                    ],
-                    generation_config={"temperature": temperature, "max_output_tokens": max_tokens},
-                )
-                return resp.text
-            elif m.startswith("ollama:"):
-                if not ollama_client:
-                    raise RuntimeError("Ollama client not configured (requires openai package)")
-                ollama_model = model[len("ollama:") :]
-                resp = ollama_client.chat.completions.create(
-                    model=ollama_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return resp.choices[0].message.content
-            raise RuntimeError("No supported provider for model: " + model)
+            text, in_tok, out_tok = backend.complete(
+                prompt, temperature=temperature, max_tokens=max_tokens
+            )
+            meta["input_tokens"] = in_tok
+            meta["output_tokens"] = out_tok
+            return text, meta
         except Exception as e:
             last_err = e
             time.sleep(1)
-    raise RuntimeError(f"Model call failed after retries: {last_err}")
+    raise RuntimeError(f"Model call failed after {retries} retries: {last_err}")
 
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Configure logging — stderr so stdout is clean for piped JSONL events
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stderr,
+)
 logger = logging.getLogger(__name__)
 
 # Game Configuration
@@ -540,8 +648,12 @@ def get_ladder_name(value: int) -> str:
     return "Return to Start Line"  # Default
 
 
-def apply_accident_risk(action_value: int, miscalc_risk: str) -> tuple[int, bool]:
-    """Apply small risk of accidental escalation at nuclear threshold"""
+def apply_accident_risk(action_value: int, miscalc_risk: str, rate_modifier: float = 1.0) -> tuple[int, bool]:
+    """Apply small risk of accidental escalation at nuclear threshold.
+
+    rate_modifier multiplies the base probability; use values >1.0 for actors with
+    elevated accident risk (e.g. improvised custody, insider threats).
+    """
     import random
 
     # Only apply accident risk at nuclear signaling level (125) and above
@@ -556,6 +668,7 @@ def apply_accident_risk(action_value: int, miscalc_risk: str) -> tuple[int, bool
         risk = 0.10  # 10% if medium risk
     else:
         risk = base_risk
+    risk *= rate_modifier
 
     if random.random() < risk:
         # Accident: escalate by 1-3 ladder rungs
@@ -967,36 +1080,36 @@ def format_military_power_status(
     opp_military_power: dict[str, float],
     my_base_cap: dict[str, float],
     opp_base_cap: dict[str, float],
-    state_name: str,
+    side: str,
 ) -> str:
     """v9: Enhanced military status showing both absolute and relative fighting power"""
 
     # Calculate relative fighting power
     rel_power = calculate_relative_fighting_power(
-        my_military_power if state_name == "State Alpha" else opp_military_power,
-        opp_military_power if state_name == "State Alpha" else my_military_power,
-        my_base_cap if state_name == "State Alpha" else opp_base_cap,
-        opp_base_cap if state_name == "State Alpha" else my_base_cap,
+        my_military_power if side == "A" else opp_military_power,
+        opp_military_power if side == "A" else my_military_power,
+        my_base_cap if side == "A" else opp_base_cap,
+        opp_base_cap if side == "A" else my_base_cap,
     )
 
     # Determine which ratios to use (A or B)
     my_conv_ratio = (
-        rel_power["conv_ratio_a"] if state_name == "State Alpha" else rel_power["conv_ratio_b"]
+        rel_power["conv_ratio_a"] if side == "A" else rel_power["conv_ratio_b"]
     )
     my_nuc_ratio = (
-        rel_power["nuc_ratio_a"] if state_name == "State Alpha" else rel_power["nuc_ratio_b"]
+        rel_power["nuc_ratio_a"] if side == "A" else rel_power["nuc_ratio_b"]
     )
     my_conv_power = (
-        rel_power["a_conv_power"] if state_name == "State Alpha" else rel_power["b_conv_power"]
+        rel_power["a_conv_power"] if side == "A" else rel_power["b_conv_power"]
     )
     my_nuc_power = (
-        rel_power["a_nuc_power"] if state_name == "State Alpha" else rel_power["b_nuc_power"]
+        rel_power["a_nuc_power"] if side == "A" else rel_power["b_nuc_power"]
     )
     opp_conv_power = (
-        rel_power["b_conv_power"] if state_name == "State Alpha" else rel_power["a_conv_power"]
+        rel_power["b_conv_power"] if side == "A" else rel_power["a_conv_power"]
     )
     opp_nuc_power = (
-        rel_power["b_nuc_power"] if state_name == "State Alpha" else rel_power["a_nuc_power"]
+        rel_power["b_nuc_power"] if side == "A" else rel_power["a_nuc_power"]
     )
 
     my_conv_pct = my_military_power["conventional"] * 100
@@ -1138,6 +1251,7 @@ def get_turn_status(turn: int, scenario_key: str, max_turns: int = 40) -> str:
 
 def generate_reflection_prompt(
     state_name: str,
+    side: str,
     role_text: str,
     opponent_reputation: dict[str, Any],
     turn: int,
@@ -1160,16 +1274,16 @@ def generate_reflection_prompt(
         opp_military_power = {"conventional": 1.0, "nuclear": 1.0}
 
     # Get base capabilities for both states
-    my_base_cap = get_base_military_capabilities("A" if state_name == "State Alpha" else "B")
-    opp_base_cap = get_base_military_capabilities("B" if state_name == "State Alpha" else "A")
+    my_base_cap = get_base_military_capabilities(side)
+    opp_base_cap = get_base_military_capabilities("B" if side == "A" else "A")
 
     # Format military power status with relative strength
     military_status = format_military_power_status(
-        my_military_power, opp_military_power, my_base_cap, opp_base_cap, state_name
+        my_military_power, opp_military_power, my_base_cap, opp_base_cap, side
     )
 
     scenario = SCENARIOS[scenario_key]
-    scenario_text = get_scenario_prompt(scenario, "A" if "Alpha" in state_name else "B")
+    scenario_text = get_scenario_prompt(scenario, side)
 
     # Build profile information
     profile_text = ""
@@ -1328,6 +1442,7 @@ Respond ONLY with JSON:
 
 def generate_forecast_prompt(
     state_name: str,
+    side: str,
     role_text: str,
     reflection_json: str,
     opponent_reputation: dict[str, Any],
@@ -1345,7 +1460,7 @@ def generate_forecast_prompt(
     """
 
     scenario = SCENARIOS[scenario_key]
-    scenario_text = get_scenario_prompt(scenario, "A" if "Alpha" in state_name else "B")
+    scenario_text = get_scenario_prompt(scenario, side)
 
     # Get ladder for reference
     ladder = ladder_text()
@@ -1392,6 +1507,7 @@ Respond ONLY with JSON:
 
 def generate_signal_prompt(
     state_name: str,
+    side: str,
     role_text: str,
     ladder: str,
     reflection_json: str,
@@ -1417,16 +1533,16 @@ def generate_signal_prompt(
         opp_military_power = {"conventional": 1.0, "nuclear": 1.0}
 
     # v9: Get base capabilities for both states
-    my_base_cap = get_base_military_capabilities("A" if state_name == "State Alpha" else "B")
-    opp_base_cap = get_base_military_capabilities("B" if state_name == "State Alpha" else "A")
+    my_base_cap = get_base_military_capabilities(side)
+    opp_base_cap = get_base_military_capabilities("B" if side == "A" else "A")
 
     # v9: Format military power status with relative strength
     military_status = format_military_power_status(
-        my_military_power, opp_military_power, my_base_cap, opp_base_cap, state_name
+        my_military_power, opp_military_power, my_base_cap, opp_base_cap, side
     )
 
     scenario = SCENARIOS[scenario_key]
-    scenario_text = get_scenario_prompt(scenario, "A" if "Alpha" in state_name else "B")
+    scenario_text = get_scenario_prompt(scenario, side)
 
     # Build profile information
     profile_text = ""
@@ -1584,6 +1700,7 @@ Respond ONLY with JSON:
 
 def generate_action_prompt(
     state_name: str,
+    side: str,
     role_text: str,
     ladder: str,
     reflection_json: str,
@@ -1609,16 +1726,16 @@ def generate_action_prompt(
         opp_military_power = {"conventional": 1.0, "nuclear": 1.0}
 
     # v9: Get base capabilities for both states
-    my_base_cap = get_base_military_capabilities("A" if state_name == "State Alpha" else "B")
-    opp_base_cap = get_base_military_capabilities("B" if state_name == "State Alpha" else "A")
+    my_base_cap = get_base_military_capabilities(side)
+    opp_base_cap = get_base_military_capabilities("B" if side == "A" else "A")
 
     # v9: Format military power status with relative strength
     military_status = format_military_power_status(
-        my_military_power, opp_military_power, my_base_cap, opp_base_cap, state_name
+        my_military_power, opp_military_power, my_base_cap, opp_base_cap, side
     )
 
     scenario = SCENARIOS[scenario_key]
-    scenario_text = get_scenario_prompt(scenario, "A" if "Alpha" in state_name else "B")
+    scenario_text = get_scenario_prompt(scenario, side)
 
     # Build profile information
     profile_text = ""
@@ -1795,6 +1912,8 @@ def run_single_turn(
     state_a_profiles: dict[str, Any] | None = None,
     state_b_profiles: dict[str, Any] | None = None,
     max_turns: int = 40,
+    *,
+    writer: EventWriter,
 ) -> dict[str, Any]:
     """
     v10: Run a single turn with three-phase decision architecture:
@@ -1804,10 +1923,14 @@ def run_single_turn(
     """
 
     # v10: Initialize military power if not provided
-    if a_military_power is None:
-        a_military_power = {"conventional": 1.0, "nuclear": 1.0}
-    if b_military_power is None:
-        b_military_power = {"conventional": 1.0, "nuclear": 1.0}
+    a_military_power = a_military_power or {"conventional": 1.0, "nuclear": 1.0}
+    b_military_power = b_military_power or {"conventional": 1.0, "nuclear": 1.0}
+
+    # Resolve display names from module-level configs (set by run_kahn_game_v11)
+    display_a = _side_a_config.display_name
+    display_b = _side_b_config.display_name
+    acc_mod_a = _side_a_config.military.accident_rate_modifier
+    acc_mod_b = _side_b_config.military.accident_rate_modifier
 
     ladder = ladder_text()
 
@@ -1884,9 +2007,18 @@ def run_single_turn(
 
     # v10: PHASE 1 - REFLECTION (assess opponent credibility and meta-cognition)
     # v11.1: Global max_tokens increased to 3000 to prevent Gemini truncation
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="reflection",
+        event_type=EventType.PHASE_TRANSITION,
+        source=EventSource.SYSTEM,
+        title="Phase 1: Reflection",
+    )
     try:
         reflA_prompt = generate_reflection_prompt(
-            "State Alpha",
+            display_a,
+            "A",
             role_a,
             oppA_reputation,
             turn,
@@ -1897,11 +2029,23 @@ def run_single_turn(
             state_a_profiles,
             max_turns,
         )
-        reflA_response = get_llm_response(state_a_model, reflA_prompt)
+        reflA_response, reflA_meta = get_llm_response(state_a_model, reflA_prompt)
         reflA = parse_json_response(reflA_response)
+        _emit(
+            writer,
+            turn_number=turn,
+            phase="reflection",
+            event_type=EventType.LLM_DECISION,
+            source=EventSource.LLM,
+            source_detail=state_a_model,
+            title="State A reflection",
+            body=reflA.get("situational_assessment", ""),
+            structured_data={"side": "A", "phase": "reflection", **reflA, "llm_metadata": reflA_meta},
+        )
 
         reflB_prompt = generate_reflection_prompt(
-            "State Beta",
+            display_b,
+            "B",
             role_b,
             oppB_reputation,
             turn,
@@ -1912,19 +2056,39 @@ def run_single_turn(
             state_b_profiles,
             max_turns,
         )
-        reflB_response = get_llm_response(state_b_model, reflB_prompt)
+        reflB_response, reflB_meta = get_llm_response(state_b_model, reflB_prompt)
         reflB = parse_json_response(reflB_response)
+        _emit(
+            writer,
+            turn_number=turn,
+            phase="reflection",
+            event_type=EventType.LLM_DECISION,
+            source=EventSource.LLM,
+            source_detail=state_b_model,
+            title="State B reflection",
+            body=reflB.get("situational_assessment", ""),
+            structured_data={"side": "B", "phase": "reflection", **reflB, "llm_metadata": reflB_meta},
+        )
 
     except Exception as e:
         logger.error(f"Reflection phase error on turn {turn}: {e}")
         raise
 
     # v10: PHASE 2 - FORECAST (predict opponent's next move using reflection)
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="forecast",
+        event_type=EventType.PHASE_TRANSITION,
+        source=EventSource.SYSTEM,
+        title="Phase 2: Forecast",
+    )
     try:
         foreA_prompt = generate_forecast_prompt(
-            "State Alpha",
+            display_a,
+            "A",
             role_a,
-            json.dumps(reflA, indent=2),
+            orjson.dumps(reflA, option=orjson.OPT_INDENT_2).decode(),
             oppA_reputation,
             turn,
             scenario_key,
@@ -1934,13 +2098,25 @@ def run_single_turn(
             state_a_profiles,
             max_turns,
         )
-        foreA_response = get_llm_response(state_a_model, foreA_prompt)
+        foreA_response, foreA_meta = get_llm_response(state_a_model, foreA_prompt)
         foreA = parse_json_response(foreA_response)
+        _emit(
+            writer,
+            turn_number=turn,
+            phase="forecast",
+            event_type=EventType.LLM_DECISION,
+            source=EventSource.LLM,
+            source_detail=state_a_model,
+            title="State A forecast",
+            body=foreA.get("prediction_reasoning", ""),
+            structured_data={"side": "A", "phase": "forecast", **foreA, "llm_metadata": foreA_meta},
+        )
 
         foreB_prompt = generate_forecast_prompt(
-            "State Beta",
+            display_b,
+            "B",
             role_b,
-            json.dumps(reflB, indent=2),
+            orjson.dumps(reflB, option=orjson.OPT_INDENT_2).decode(),
             oppB_reputation,
             turn,
             scenario_key,
@@ -1950,21 +2126,41 @@ def run_single_turn(
             state_b_profiles,
             max_turns,
         )
-        foreB_response = get_llm_response(state_b_model, foreB_prompt)
+        foreB_response, foreB_meta = get_llm_response(state_b_model, foreB_prompt)
         foreB = parse_json_response(foreB_response)
+        _emit(
+            writer,
+            turn_number=turn,
+            phase="forecast",
+            event_type=EventType.LLM_DECISION,
+            source=EventSource.LLM,
+            source_detail=state_b_model,
+            title="State B forecast",
+            body=foreB.get("prediction_reasoning", ""),
+            structured_data={"side": "B", "phase": "forecast", **foreB, "llm_metadata": foreB_meta},
+        )
 
     except Exception as e:
         logger.error(f"Forecast phase error on turn {turn}: {e}")
         raise
 
     # v10: PHASE 3a - SIGNAL (choose signals with full context)
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="signal",
+        event_type=EventType.PHASE_TRANSITION,
+        source=EventSource.SYSTEM,
+        title="Phase 3a: Signal",
+    )
     try:
         sigA_prompt = generate_signal_prompt(
-            "State Alpha",
+            display_a,
+            "A",
             role_a,
             ladder,
-            json.dumps(reflA, indent=2),
-            json.dumps(foreA, indent=2),
+            orjson.dumps(reflA, option=orjson.OPT_INDENT_2).decode(),
+            orjson.dumps(foreA, option=orjson.OPT_INDENT_2).decode(),
             oppA_reputation,
             turn,
             scenario_key,
@@ -1974,15 +2170,16 @@ def run_single_turn(
             state_a_profiles,
             max_turns,
         )
-        sigA_response = get_llm_response(state_a_model, sigA_prompt)
+        sigA_response, sigA_meta = get_llm_response(state_a_model, sigA_prompt)
         sigA = parse_json_response(sigA_response)
 
         sigB_prompt = generate_signal_prompt(
-            "State Beta",
+            display_b,
+            "B",
             role_b,
             ladder,
-            json.dumps(reflB, indent=2),
-            json.dumps(foreB, indent=2),
+            orjson.dumps(reflB, option=orjson.OPT_INDENT_2).decode(),
+            orjson.dumps(foreB, option=orjson.OPT_INDENT_2).decode(),
             oppB_reputation,
             turn,
             scenario_key,
@@ -1992,7 +2189,7 @@ def run_single_turn(
             state_b_profiles,
             max_turns,
         )
-        sigB_response = get_llm_response(state_b_model, sigB_prompt)
+        sigB_response, sigB_meta = get_llm_response(state_b_model, sigB_prompt)
         sigB = parse_json_response(sigB_response)
 
     except Exception as e:
@@ -2064,14 +2261,62 @@ def run_single_turn(
     b_public = sigB.get("public_statement", "No statement")
     b_signal_rationale = sigB.get("private_rationale", "No rationale provided")
 
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="signal",
+        event_type=EventType.LLM_DECISION,
+        source=EventSource.LLM,
+        source_detail=state_a_model,
+        title="State A signal",
+        body=a_public,
+        structured_data={
+            "side": "A",
+            "phase": "signal",
+            "immediate_signal": sigA.get("immediate_signal"),
+            "immediate_signal_value": a_immediate_val,
+            "conditional_signal": a_conditional_text,
+            "public_statement": a_public,
+            "llm_metadata": sigA_meta,
+        },
+    )
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="signal",
+        event_type=EventType.LLM_DECISION,
+        source=EventSource.LLM,
+        source_detail=state_b_model,
+        title="State B signal",
+        body=b_public,
+        structured_data={
+            "side": "B",
+            "phase": "signal",
+            "immediate_signal": sigB.get("immediate_signal"),
+            "immediate_signal_value": b_immediate_val,
+            "conditional_signal": b_conditional_text,
+            "public_statement": b_public,
+            "llm_metadata": sigB_meta,
+        },
+    )
+
     # v10: PHASE 3b - ACTION (choose action with full context and consistency statement)
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="action",
+        event_type=EventType.PHASE_TRANSITION,
+        source=EventSource.SYSTEM,
+        title="Phase 3b: Action",
+    )
     try:
         actA_prompt = generate_action_prompt(
-            "State Alpha",
+            display_a,
+            "A",
             role_a,
             ladder,
-            json.dumps(reflA, indent=2),
-            json.dumps(foreA, indent=2),
+            orjson.dumps(reflA, option=orjson.OPT_INDENT_2).decode(),
+            orjson.dumps(foreA, option=orjson.OPT_INDENT_2).decode(),
             oppA_reputation,
             turn,
             scenario_key,
@@ -2081,15 +2326,16 @@ def run_single_turn(
             state_a_profiles,
             max_turns,
         )
-        actA_response = get_llm_response(state_a_model, actA_prompt)
+        actA_response, actA_meta = get_llm_response(state_a_model, actA_prompt)
         a_act_obj = parse_json_response(actA_response)
 
         actB_prompt = generate_action_prompt(
-            "State Beta",
+            display_b,
+            "B",
             role_b,
             ladder,
-            json.dumps(reflB, indent=2),
-            json.dumps(foreB, indent=2),
+            orjson.dumps(reflB, option=orjson.OPT_INDENT_2).decode(),
+            orjson.dumps(foreB, option=orjson.OPT_INDENT_2).decode(),
             oppB_reputation,
             turn,
             scenario_key,
@@ -2099,7 +2345,7 @@ def run_single_turn(
             state_b_profiles,
             max_turns,
         )
-        actB_response = get_llm_response(state_b_model, actB_prompt)
+        actB_response, actB_meta = get_llm_response(state_b_model, actB_prompt)
         b_act_obj = parse_json_response(actB_response)
 
     except Exception as e:
@@ -2109,7 +2355,7 @@ def run_single_turn(
     # Extract action data (Phase 3b) and apply accident risk
     a_action_rung = a_act_obj.get("action_rung", "Return to Start Line")
     a_action_val = get_ladder_value(a_action_rung)
-    a_action_val, a_accident = apply_accident_risk(a_action_val, a_miscalc_risk)
+    a_action_val, a_accident = apply_accident_risk(a_action_val, a_miscalc_risk, acc_mod_a)
     a_action_rung = get_ladder_name(a_action_val)  # Update name if accident occurred
     a_consistency_statement = a_act_obj.get(
         "consistency_statement", "No consistency statement provided"
@@ -2118,7 +2364,7 @@ def run_single_turn(
 
     b_action_rung = b_act_obj.get("action_rung", "Return to Start Line")
     b_action_val = get_ladder_value(b_action_rung)
-    b_action_val, b_accident = apply_accident_risk(b_action_val, b_miscalc_risk)
+    b_action_val, b_accident = apply_accident_risk(b_action_val, b_miscalc_risk, acc_mod_b)
     b_action_rung = get_ladder_name(b_action_val)  # Update name if accident occurred
     b_consistency_statement = b_act_obj.get(
         "consistency_statement", "No consistency statement provided"
@@ -2133,6 +2379,65 @@ def run_single_turn(
     if b_accident:
         logger.info(
             f"ACCIDENT: State B action escalated due to miscalculation (risk: {b_miscalc_risk})"
+        )
+
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="action",
+        event_type=EventType.LLM_DECISION,
+        source=EventSource.LLM,
+        source_detail=state_a_model,
+        title="State A action",
+        body=a_action_rationale,
+        structured_data={
+            "side": "A",
+            "phase": "action",
+            "action_rung": a_action_rung,
+            "action_value": a_action_val,
+            "accident_occurred": a_accident,
+            "consistency_statement": a_consistency_statement,
+            "llm_metadata": actA_meta,
+        },
+    )
+    _emit(
+        writer,
+        turn_number=turn,
+        phase="action",
+        event_type=EventType.LLM_DECISION,
+        source=EventSource.LLM,
+        source_detail=state_b_model,
+        title="State B action",
+        body=b_action_rationale,
+        structured_data={
+            "side": "B",
+            "phase": "action",
+            "action_rung": b_action_rung,
+            "action_value": b_action_val,
+            "accident_occurred": b_accident,
+            "consistency_statement": b_consistency_statement,
+            "llm_metadata": actB_meta,
+        },
+    )
+    if a_accident:
+        _emit(
+            writer,
+            turn_number=turn,
+            phase="action",
+            event_type=EventType.ANNOTATION,
+            source=EventSource.SIMULATION,
+            title="Accidental escalation: State A",
+            body=f"Miscalculation risk ({a_miscalc_risk}) triggered unintended escalation",
+        )
+    if b_accident:
+        _emit(
+            writer,
+            turn_number=turn,
+            phase="action",
+            event_type=EventType.ANNOTATION,
+            source=EventSource.SIMULATION,
+            title="Accidental escalation: State B",
+            body=f"Miscalculation risk ({b_miscalc_risk}) triggered unintended escalation",
         )
 
     # Check for game ending conditions
@@ -2193,6 +2498,57 @@ def run_single_turn(
 
     if game_over:
         logger.info(f"GAME OVER: {end_reason}")
+
+    # Emit state change, KPI, and situation report events
+    _emit(
+        writer,
+        turn_number=turn,
+        event_type=EventType.STATE_CHANGE,
+        source=EventSource.SIMULATION,
+        title="Territory and military update",
+        body=f"Territory: {prev_territory:.3f} -> {territory_balance:.3f} (change: {territory_change:+.3f})",
+        structured_data={
+            "territory_balance_before": round(prev_territory, 4),
+            "territory_balance_after": round(territory_balance, 4),
+            "territory_change": round(territory_change, 4),
+            "a_action_effective": a_effective_val,
+            "b_action_effective": b_effective_val,
+            "a_military_power": a_military_power,
+            "b_military_power": b_military_power,
+        },
+    )
+    _emit(
+        writer,
+        turn_number=turn,
+        event_type=EventType.KPI_UPDATE,
+        source=EventSource.SIMULATION,
+        title="KPIs",
+        structured_data={
+            "territory_balance": round(territory_balance, 4),
+            "territory_change": round(territory_change, 4),
+            "a_conventional_power": round(a_military_power["conventional"], 4),
+            "a_nuclear_power": round(a_military_power["nuclear"], 4),
+            "b_conventional_power": round(b_military_power["conventional"], 4),
+            "b_nuclear_power": round(b_military_power["nuclear"], 4),
+            "a_signal_value": a_immediate_val,
+            "a_action_value": a_effective_val,
+            "b_signal_value": b_immediate_val,
+            "b_action_value": b_effective_val,
+            "signal_action_gap_a": a_effective_val - a_immediate_val,
+            "signal_action_gap_b": b_effective_val - b_immediate_val,
+        },
+    )
+    _emit(
+        writer,
+        turn_number=turn,
+        event_type=EventType.SITUATION_REPORT,
+        source=EventSource.SIMULATION,
+        title=f"Turn {turn} summary",
+        body=f"A: {a_action_rung} (signaled {get_ladder_name(a_immediate_val)}), "
+        f"B: {b_action_rung} (signaled {get_ladder_name(b_immediate_val)}). "
+        f"Territory: {territory_balance:+.2f}",
+        structured_data={"game_over": game_over, "end_reason": end_reason},
+    )
 
     # Return comprehensive turn data
     return {
@@ -2304,6 +2660,139 @@ def run_single_turn(
     }
 
 
+def _load_resume_state(events_file: str, resume_from_turn: int) -> dict:
+    """Read an existing JSONL and reconstruct game state up to *resume_from_turn*.
+
+    Returns a dict with all fields needed to resume a simulation:
+    - game params from GAME_START event
+    - territory/military state from last STATE_CHANGE at turn <= resume_from_turn
+    - reconstructed history list for turns 1..resume_from_turn
+    - max_sequence for initialising the EventWriter at the correct offset
+    """
+    raw_events = []
+    with open(events_file, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                try:
+                    raw_events.append(orjson.loads(line))
+                except Exception:
+                    pass
+
+    # ── Extract GAME_START params ──────────────────────────────────────
+    game_start = next(
+        (e for e in raw_events if e.get("event_type") == "GAME_START"), None
+    )
+    gs_data: dict = (game_start or {}).get("structured_data") or {}
+
+    scenario_key      = gs_data.get("scenario_key",      "v7_alliance")
+    aggressor_side    = gs_data.get("aggressor_side",    "A")
+    max_turns_orig    = int(gs_data.get("max_turns",     50))
+    scenario_deadline = gs_data.get("scenario_deadline")
+    state_a_id        = gs_data.get("state_a_id",        "A")
+    state_b_id        = gs_data.get("state_b_id",        "B")
+    state_a_model_def = gs_data.get("state_a_model",     "")
+    state_b_model_def = gs_data.get("state_b_model",     "")
+
+    # ── Initial state from GAME_START ─────────────────────────────────
+    territory_balance = float(gs_data.get("start_balance", 0.0))
+    a_military_power  = {"conventional": 1.0, "nuclear": 1.0}
+    b_military_power  = {"conventional": 1.0, "nuclear": 1.0}
+
+    # ── Update from every STATE_CHANGE at turn <= resume_from_turn ────
+    for e in raw_events:
+        if e.get("event_type") != "STATE_CHANGE":
+            continue
+        if (e.get("turn_number") or 0) > resume_from_turn:
+            continue
+        sd = e.get("structured_data") or {}
+        if "territory_balance_after" in sd:
+            territory_balance = float(sd["territory_balance_after"])
+        if "a_military_power" in sd:
+            a_military_power = dict(sd["a_military_power"])
+        if "b_military_power" in sd:
+            b_military_power = dict(sd["b_military_power"])
+
+    # ── Reconstruct per-turn history from KPI / LLM_DECISION events ──
+    turn_data: dict[int, dict] = {}
+
+    for e in raw_events:
+        tn = e.get("turn_number", 0)
+        if tn < 1 or tn > resume_from_turn:
+            continue
+        etype = e.get("event_type", "")
+        sd = e.get("structured_data") or {}
+
+        if tn not in turn_data:
+            turn_data[tn] = {"turn": tn, "game_over": False}
+
+        if etype == "KPI_UPDATE":
+            td = turn_data[tn]
+            td["territory_balance"] = sd.get("territory_balance", territory_balance)
+            td["a_action_value"]    = sd.get("a_action_value",    0.0)
+            td["b_action_value"]    = sd.get("b_action_value",    0.0)
+            # KPI uses a_signal_value; history uses a_immediate_signal_value
+            td.setdefault("a_immediate_signal_value", sd.get("a_signal_value", 0.0))
+            td.setdefault("b_immediate_signal_value", sd.get("b_signal_value", 0.0))
+            td["a_conventional_power"] = sd.get("a_conventional_power", 1.0)
+            td["a_nuclear_power"]      = sd.get("a_nuclear_power",      1.0)
+            td["b_conventional_power"] = sd.get("b_conventional_power", 1.0)
+            td["b_nuclear_power"]      = sd.get("b_nuclear_power",      1.0)
+
+        elif etype == "LLM_DECISION":
+            phase = e.get("phase", "")
+            side  = sd.get("side", "")
+            td    = turn_data[tn]
+            if phase == "signal":
+                if side == "A":
+                    td["a_conditional_signal_text"]  = sd.get("conditional_signal", "")
+                    td["a_immediate_signal_value"]   = sd.get("immediate_signal_value", 0.0)
+                elif side == "B":
+                    td["b_conditional_signal_text"]  = sd.get("conditional_signal", "")
+                    td["b_immediate_signal_value"]   = sd.get("immediate_signal_value", 0.0)
+            elif phase == "action":
+                if side == "A":
+                    td["a_accident"] = bool(sd.get("accident_occurred", False))
+                elif side == "B":
+                    td["b_accident"] = bool(sd.get("accident_occurred", False))
+
+        elif etype == "STATE_CHANGE":
+            td = turn_data[tn]
+            if "a_military_power" in sd:
+                td["a_military_power"] = dict(sd["a_military_power"])
+            if "b_military_power" in sd:
+                td["b_military_power"] = dict(sd["b_military_power"])
+
+    # Fill in defaults for any missing per-turn fields
+    for tn, td in turn_data.items():
+        td.setdefault("a_conditional_signal_text", "")
+        td.setdefault("b_conditional_signal_text", "")
+        td.setdefault("a_accident",    False)
+        td.setdefault("b_accident",    False)
+        td.setdefault("a_military_power", dict(a_military_power))
+        td.setdefault("b_military_power", dict(b_military_power))
+
+    history = [turn_data[tn] for tn in sorted(turn_data)]
+
+    max_sequence = max((e.get("sequence_number", 0) for e in raw_events), default=0)
+
+    return {
+        "scenario_key":      scenario_key,
+        "aggressor_side":    aggressor_side,
+        "max_turns_orig":    max_turns_orig,
+        "scenario_deadline": scenario_deadline,
+        "state_a_id":        state_a_id,
+        "state_b_id":        state_b_id,
+        "state_a_model_def": state_a_model_def,
+        "state_b_model_def": state_b_model_def,
+        "territory_balance": territory_balance,
+        "a_military_power":  a_military_power,
+        "b_military_power":  b_military_power,
+        "history":           history,
+        "max_sequence":      max_sequence,
+    }
+
+
 def run_kahn_game_v11(
     state_a_model: str,
     state_b_model: str,
@@ -2312,6 +2801,10 @@ def run_kahn_game_v11(
     scenario_key: str = "v7_alliance",
     start_balance: float = 0.0,
     results_dir: str | None = None,
+    events_file: str | None = None,
+    side_a_config: "StateConfig | None" = None,
+    side_b_config: "StateConfig | None" = None,
+    resume_from_turn: int | None = None,
 ) -> str:
     """
     v11: Run a complete Kahn Game with three-phase decision architecture + memory systems.
@@ -2320,6 +2813,60 @@ def run_kahn_game_v11(
     Phase 3 (Decision): Choose signals and action with full context, including consistency statement
     All v9 features retained (military capabilities, gating, etc.)
     """
+    global _side_a_config, _side_b_config
+
+    # ── Resume mode: load all params from existing JSONL ─────────────────
+    if resume_from_turn is not None and events_file is not None and events_file != "-":
+        resume_state = _load_resume_state(events_file, resume_from_turn)
+
+        # Override game params from the existing event log (not from CLI)
+        scenario_key   = resume_state["scenario_key"]
+        aggressor_side = resume_state["aggressor_side"]
+        scenario_deadline = resume_state["scenario_deadline"]
+
+        # State configs come from the IDs in the log; override any CLI values
+        sa_id = resume_state["state_a_id"]
+        sb_id = resume_state["state_b_id"]
+        side_a_config = REGISTRY.get(sa_id, side_a_config)
+        side_b_config = REGISTRY.get(sb_id, side_b_config)
+
+        # Fall back to models recorded in the log when caller didn't specify
+        if not state_a_model:
+            state_a_model = resume_state["state_a_model_def"]
+        if not state_b_model:
+            state_b_model = resume_state["state_b_model_def"]
+
+        # Restore simulation state
+        territory_balance = resume_state["territory_balance"]
+        a_military_power  = resume_state["a_military_power"]
+        b_military_power  = resume_state["b_military_power"]
+        history           = resume_state["history"]
+
+        # max_turns = resume point + desired additional turns
+        # This lets the branch run further than the parent would have
+        max_turns = resume_from_turn + max_turns
+
+        initial_seq = resume_state["max_sequence"]
+        logger.info(
+            "Resuming from turn %d (seq %d): %s vs %s, scenario=%s",
+            resume_from_turn, initial_seq, state_a_model, state_b_model, scenario_key,
+        )
+    else:
+        # ── Fresh start ───────────────────────────────────────────────
+        history = []
+        try:
+            sb = float(start_balance)
+        except Exception:
+            sb = 0.0
+        territory_balance = max(-5.0, min(5.0, sb))
+        a_military_power  = {"conventional": 1.0, "nuclear": 1.0}
+        b_military_power  = {"conventional": 1.0, "nuclear": 1.0}
+        scenario_deadline = None  # will be set from scenario below
+        initial_seq       = 0
+        resume_from_turn  = None  # ensure consistent type
+
+    _side_a_config = side_a_config if side_a_config is not None else STATE_A
+    _side_b_config = side_b_config if side_b_config is not None else STATE_B
 
     logger.info(
         f"Starting Kahn Game v12: {state_a_model} vs {state_b_model} (aggressor: {aggressor_side})"
@@ -2327,33 +2874,165 @@ def run_kahn_game_v11(
 
     # v12: Get scenario deadline if applicable
     scenario = SCENARIOS.get(scenario_key, {})
-    scenario_deadline = scenario.get("time_limit")
+    if resume_from_turn is None:
+        # Fresh start: scenario deadline comes from the scenario config
+        scenario_deadline = scenario.get("time_limit")
 
-    # Load state profiles
-    state_a_profiles = {
-        "leader": load_json_safe("state_a_leader_kahn.json"),
-        "military": load_json_safe("state_a_military_kahn.json"),
-        "assessment": load_json_safe("state_a_assessment_kahn.json"),
-    }
-    state_b_profiles = {
-        "leader": load_json_safe("state_b_leader_kahn.json"),
-        "military": load_json_safe("state_b_military_kahn.json"),
-        "assessment": load_json_safe("state_b_assessment_kahn.json"),
-    }
+    # Load state profiles from typed config models
+    state_a_profiles = _side_a_config.model_dump()
+    state_b_profiles = _side_b_config.model_dump()
 
-    history = []
-    # Initialize starting balance (clamped to current victory bounds ±2.0)
-    try:
-        sb = float(start_balance)
-    except Exception:
-        sb = 0.0
-    territory_balance = max(-5.0, min(5.0, sb))
+    # Build output paths early so the JSONL writer can start before the loop
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    filename = re.sub(
+        r"[^\w\s.\-]",
+        "",
+        f"kahn_game_v12_{state_a_model}_vs_{state_b_model}_agg_{aggressor_side}"
+        f"_{timestamp}_{scenario_key}_bal_{start_balance}.csv",
+    )
+    if results_dir is None:
+        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Kahn results")
+    os.makedirs(results_dir, exist_ok=True)
+    filepath = os.path.join(results_dir, filename)
 
-    # v10: Initialize military power (starts at 100% for both states)
-    a_military_power = {"conventional": 1.0, "nuclear": 1.0}
-    b_military_power = {"conventional": 1.0, "nuclear": 1.0}
+    # Create JSONL event writer — file (with fsync) or stdout (for piping)
+    if events_file is None:
+        jsonl_path = filepath.rsplit(".", 1)[0] + ".jsonl"
+        writer = EventWriter(jsonl_path, initial_seq=initial_seq)
+    else:
+        writer = EventWriter(
+            events_file if events_file != "-" else None,
+            initial_seq=initial_seq,
+        )
 
-    for turn in range(1, max_turns + 1):
+    # ── Turn-0 setup (skipped when resuming — already in the file) ────────
+    if resume_from_turn is None:
+        _emit(
+            writer,
+            turn_number=0,
+            event_type=EventType.GAME_START,
+            source=EventSource.SIMULATION,
+            title="Game started",
+            body=f"{state_a_model} vs {state_b_model}, scenario={scenario_key}, aggressor={aggressor_side}",
+            structured_data={
+                "state_a_model": state_a_model,
+                "state_b_model": state_b_model,
+                "aggressor_side": aggressor_side,
+                "scenario_key": scenario_key,
+                "scenario_name": scenario.get("name", ""),
+                "max_turns": max_turns,
+                "scenario_deadline": scenario_deadline,
+                "start_balance": territory_balance,
+                "llm_temperature": 0.7,
+                "llm_max_tokens": 3000,
+                # Actor identity (display name shown in UI and prompts)
+                "state_a_display_name": _side_a_config.display_name,
+                "state_b_display_name": _side_b_config.display_name,
+                "state_a_id": _side_a_config.state_id,
+                "state_b_id": _side_b_config.state_id,
+                # Full leader/military/assessment profiles for both sides
+                "state_a_leader": state_a_profiles.get("leader") or {},
+                "state_b_leader": state_b_profiles.get("leader") or {},
+                "state_a_military": state_a_profiles.get("military") or {},
+                "state_b_military": state_b_profiles.get("military") or {},
+                "state_a_assessment": state_a_profiles.get("assessment") or {},
+                "state_b_assessment": state_b_profiles.get("assessment") or {},
+            },
+        )
+
+        # ── Turn 0: Scenario briefing ─────────────────────────────────
+        _emit(
+            writer,
+            turn_number=0,
+            event_type=EventType.PHASE_TRANSITION,
+            source=EventSource.SYSTEM,
+            title="Scenario",
+            phase="scenario",
+        )
+        scenario_body_parts = [scenario.get("context", "")]
+        if scenario.get("stakes"):
+            scenario_body_parts.append(f"STAKES: {scenario['stakes']}")
+        if scenario.get("pressure"):
+            scenario_body_parts.append(f"PRESSURE: {scenario['pressure']}")
+        if scenario.get("time_limit"):
+            scenario_body_parts.append(
+                f"TIME PRESSURE: Critical decisions within {scenario['time_limit']} turns."
+            )
+        if scenario.get("consequences"):
+            scenario_body_parts.append(f"CONSEQUENCES: {scenario['consequences']}")
+        _emit(
+            writer,
+            turn_number=0,
+            event_type=EventType.SITUATION_REPORT,
+            source=EventSource.SIMULATION,
+            title=f"Scenario: {scenario.get('name', scenario_key)}",
+            body="\n\n".join(scenario_body_parts),
+            phase="scenario",
+            structured_data={
+                "scenario_key": scenario_key,
+                "scenario_name": scenario.get("name", ""),
+                "context": scenario.get("context", ""),
+                "stakes": scenario.get("stakes", ""),
+                "pressure": scenario.get("pressure", ""),
+                "time_limit": scenario.get("time_limit"),
+                "consequences": scenario.get("consequences", ""),
+            },
+        )
+
+        # ── Turn 0: State profiles ────────────────────────────────────
+        _emit(
+            writer,
+            turn_number=0,
+            event_type=EventType.PHASE_TRANSITION,
+            source=EventSource.SYSTEM,
+            title="State Profiles",
+            phase="profiles",
+        )
+        for side, profiles, model_name in [
+            ("A", state_a_profiles, state_a_model),
+            ("B", state_b_profiles, state_b_model),
+        ]:
+            leader      = profiles.get("leader") or {}
+            military    = profiles.get("military") or {}
+            assessment  = profiles.get("assessment") or {}
+            leader_name = leader.get("name", f"Leader {side}")
+            leader_bio  = leader.get("biography", "")
+            _emit(
+                writer,
+                turn_number=0,
+                event_type=EventType.SITUATION_REPORT,
+                source=EventSource.SIMULATION,
+                title=f"State {side} \u2014 {leader_name}",
+                body=leader_bio,
+                phase="profiles",
+                structured_data={
+                    "side":       side,
+                    "model":      model_name,
+                    "leader":     leader,
+                    "military":   military,
+                    "assessment": assessment,
+                },
+            )
+
+        # ── Turn 0: Initial state ─────────────────────────────────────
+        _emit(
+            writer,
+            turn_number=0,
+            event_type=EventType.STATE_CHANGE,
+            source=EventSource.SIMULATION,
+            title="Initial conditions",
+            structured_data={
+                "territory_balance_before": 0.0,
+                "territory_balance_after":  territory_balance,
+                "territory_change":         territory_balance,
+                "a_military_power":         dict(a_military_power),
+                "b_military_power":         dict(b_military_power),
+            },
+        )
+
+    start_turn = (resume_from_turn or 0) + 1
+
+    for turn in range(start_turn, max_turns + 1):
         # Check for victory at the START of each turn (before models make decisions)
         if abs(territory_balance) >= 5.0:
             winner = "State A" if territory_balance >= 5.0 else "State B"
@@ -2398,6 +3077,7 @@ def run_kahn_game_v11(
                 state_a_profiles,
                 state_b_profiles,
                 max_turns,
+                writer=writer,
             )
             history.append(turn_data)
 
@@ -2414,23 +3094,23 @@ def run_kahn_game_v11(
             logger.error(f"Error on turn {turn}: {e}")
             break
 
-    # Generate filename and save results
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    # clean the model tags and scenario key for use in constructing a valid filename
-    #  don't remove any identifying information from either tag, only convert to a valid filename
-    # use a comprehensive regex replacement to remove any special characters or spaces
-    # periods are permitted.
-    filename = re.sub(
-        r"[^\w\s-.]",
-        "",
-        f"kahn_game_v12_{state_a_model}_vs_{state_b_model}_agg_{aggressor_side}_{timestamp}_{scenario_key}_bal_{start_balance}.csv",
+    # Emit GAME_END event and close writer
+    last = history[-1] if history else {}
+    _emit(
+        writer,
+        turn_number=last.get("turn", 0),
+        event_type=EventType.GAME_END,
+        source=EventSource.SIMULATION,
+        title=last.get("end_reason") or "Max turns reached",
+        body=last.get("end_reason") or "Max turns reached",
+        structured_data={
+            "total_turns": len(history),
+            "final_territory": last.get("territory_balance", 0),
+            "end_reason": last.get("end_reason") or "max_turns_reached",
+            "game_over": last.get("game_over", False),
+        },
     )
-
-    # Save to specified results directory, or default to 'Kahn results'
-    if results_dir is None:
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Kahn results")
-    os.makedirs(results_dir, exist_ok=True)
-    filepath = os.path.join(results_dir, filename)
+    writer.close()
 
     # Write CSV
     if history:
@@ -2447,8 +3127,29 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run Kahn Game v12 with Explicit Turn Tracking + Deadline Enforcement"
     )
-    parser.add_argument("--model_a", required=True, help="Model for State A")
-    parser.add_argument("--model_b", required=True, help="Model for State B")
+    parser.add_argument(
+        "--model_a",
+        required=False,
+        default=None,
+        help="Model for State A (required unless --resume-from-turn is used)",
+    )
+    parser.add_argument(
+        "--model_b",
+        required=False,
+        default=None,
+        help="Model for State B (required unless --resume-from-turn is used)",
+    )
+    parser.add_argument(
+        "--resume-from-turn",
+        type=int,
+        default=None,
+        dest="resume_from_turn",
+        help=(
+            "Resume simulation from this turn number, reading game state from "
+            "--events-file.  When set, --scenario / --aggressor / --start_balance / "
+            "--state_a / --state_b are all derived from the existing event log."
+        ),
+    )
     parser.add_argument(
         "--aggressor", choices=["A", "B"], default="A", help="Which side is the aggressor"
     )
@@ -2475,17 +3176,52 @@ def main():
     parser.add_argument(
         "--start_balance", type=float, default=0.0, help="Initial territory balance (-5.0 to +5.0)"
     )
+    parser.add_argument(
+        "--events-file",
+        type=str,
+        default=None,
+        help="Write JSONL events to this file (default: alongside CSV). Use '-' for stdout.",
+    )
+    parser.add_argument(
+        "--state_a",
+        type=str,
+        default="A",
+        choices=list(REGISTRY.keys()),
+        help=f"Actor config for side A (default: A). Available: {', '.join(REGISTRY.keys())}",
+    )
+    parser.add_argument(
+        "--state_b",
+        type=str,
+        default="B",
+        choices=list(REGISTRY.keys()),
+        help=f"Actor config for side B (default: B). Available: {', '.join(REGISTRY.keys())}",
+    )
 
     args = parser.parse_args()
 
+    # Validate: non-resume mode requires explicit model names
+    if args.resume_from_turn is None:
+        if not args.model_a or not args.model_b:
+            parser.error("--model_a and --model_b are required when --resume-from-turn is not set")
+        if args.resume_from_turn is None and args.events_file is None:
+            pass  # normal fresh run; events_file optional
+
+    # When resuming, events_file is mandatory
+    if args.resume_from_turn is not None and not args.events_file:
+        parser.error("--events-file is required when using --resume-from-turn")
+
     try:
         result_file = run_kahn_game_v11(
-            state_a_model=args.model_a,
-            state_b_model=args.model_b,
+            state_a_model=args.model_a or "",
+            state_b_model=args.model_b or "",
             aggressor_side=args.aggressor,
             max_turns=args.turns,
             scenario_key=args.scenario,
             start_balance=args.start_balance,
+            events_file=args.events_file,
+            side_a_config=REGISTRY[args.state_a],
+            side_b_config=REGISTRY[args.state_b],
+            resume_from_turn=args.resume_from_turn,
         )
         print(f"Game completed successfully. Results: {result_file}")
 
